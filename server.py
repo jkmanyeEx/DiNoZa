@@ -9,18 +9,19 @@ VIDEO_HOST = "0.0.0.0"
 VIDEO_PORT = 8000
 CONTROL_PORT = 8001
 
-PERSON = 15
+PERSON = 15  # class id for "person" in MobileNetSSD
 
-# Load MobileNet SSD Model
+# Load MobileNet SSD model (make sure these files exist in same dir)
 net = cv2.dnn.readNetFromCaffe(
     "MobileNetSSD_deploy.prototxt",
     "MobileNetSSD_deploy.caffemodel"
 )
 
 state = {
-    "mode": "auto",
-    "last_cmd": None
+    "mode": "auto",   # "auto" or "manual"
+    "last_cmd": None  # latest manual command
 }
+
 
 ############################################################
 # CONTROL SERVER
@@ -70,7 +71,7 @@ def control_handler(conn):
 # VIDEO SERVER (camera initialized once)
 ############################################################
 def video_server():
-    # Initialize camera only once
+    # Initialize camera ONCE
     cam = Picamera2()
     config = cam.create_video_configuration(
         main={"size": (640, 480), "format": "RGB888"},
@@ -80,12 +81,12 @@ def video_server():
     cam.start()
     print("[VIDEO] Camera started")
 
-    # Setup socket
+    # Setup TCP server
     sock = socket.socket()
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((VIDEO_HOST, VIDEO_PORT))
     sock.listen(1)
-    print("[VIDEO] Listening")
+    print("[VIDEO] Listening on", VIDEO_PORT)
 
     while True:
         conn, addr = sock.accept()
@@ -96,7 +97,7 @@ def video_server():
 
 
 ############################################################
-# HANDLE VIDEO STREAM TO ONE CLIENT
+# HANDLE VIDEO STREAM FOR ONE CLIENT
 ############################################################
 def serve_video(conn, cam):
     while True:
@@ -104,9 +105,7 @@ def serve_video(conn, cam):
         h, w = frame.shape[:2]
         mid_x = w // 2
 
-        ######################################################
-        # PERSON DETECTION
-        ######################################################
+        # ------------- PERSON DETECTION -------------
         blob = cv2.dnn.blobFromImage(
             cv2.resize(frame, (300, 300)),
             0.007843,
@@ -116,42 +115,57 @@ def serve_video(conn, cam):
         net.setInput(blob)
         detections = net.forward()
 
-        candidates = []
-        selected_person = None
+        boxes = []
+        confs = []
 
-        # Loop over detections
+        # Collect raw boxes & confidences
         for i in range(detections.shape[2]):
-            confidence = detections[0, 0, i, 2]
+            conf = detections[0, 0, i, 2]
             cls = int(detections[0, 0, i, 1])
 
-            if cls == PERSON and confidence > 0.40:
-                # Box coords
+            if cls == PERSON and conf > 0.60:  # threshold tuned
                 box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
                 x1, y1, x2, y2 = box.astype(int)
+                boxes.append([x1, y1, x2 - x1, y2 - y1])  # x, y, w, h
+                confs.append(float(conf))
 
-                # Draw bounding box
-                cv2.rectangle(frame, (x1, y1), (x2, y2),
-                              (0, 255, 0), 2)
+        candidates = []
 
-                # Person center
-                cx = (x1 + x2) // 2
-                cy = (y1 + y2) // 2
-                cv2.circle(frame, (cx, cy), 4, (0, 0, 255), -1)
+        # ------------- NMS TO MERGE OVERLAPS -------------
+        if len(boxes) > 0:
+            idxs = cv2.dnn.NMSBoxes(boxes, confs, score_threshold=0.60, nms_threshold=0.40)
 
-                # append candidate
-                candidates.append((abs(cx - mid_x), cx, cy))
+            if len(idxs) > 0:
+                # idxs might be list of lists or np array
+                for i in np.array(idxs).flatten():
+                    x, y, bw, bh = boxes[i]
+                    x1, y1 = x, y
+                    x2, y2 = x + bw, y + bh
 
-        ######################################################
-        # AUTO MODE — pick closest to center
-        ######################################################
+                    # Draw bounding box
+                    cv2.rectangle(frame, (x1, y1), (x2, y2),
+                                  (0, 255, 0), 2)
+
+                    # Center point
+                    cx = (x1 + x2) // 2
+                    cy = (y1 + y2) // 2
+                    cv2.circle(frame, (cx, cy), 4, (0, 0, 255), -1)
+
+                    # For AUTO logic: (distance to center, cx, cy)
+                    candidates.append((abs(cx - mid_x), cx, cy))
+
+        # Debug: how many persons after NMS
+        # print("[DETECT] Persons after NMS:", len(candidates))
+
+        # ------------- AUTO MODE: PICK CLOSEST TO CENTER -------------
         if state["mode"] == "auto" and candidates:
-            candidates.sort(key=lambda x: x[0])   # pick closest to center
+            # sort by |cx - mid_x| (closest to screen center)
+            candidates.sort(key=lambda x: x[0])
             _, cx, cy = candidates[0]
 
-            # draw highlight circle
+            # highlight chosen target
             cv2.circle(frame, (cx, cy), 12, (255, 0, 0), 2)
 
-            # AUTO direction logic
             if cx < mid_x - 40:
                 print("[AUTO] LEFT")
             elif cx > mid_x + 40:
@@ -159,9 +173,7 @@ def serve_video(conn, cam):
             else:
                 print("[AUTO] CENTER")
 
-        ######################################################
-        # SEND FRAME
-        ######################################################
+        # ------------- ENCODE & SEND FRAME -------------
         ok, jpg = cv2.imencode(".jpg", frame,
                                [cv2.IMWRITE_JPEG_QUALITY, 80])
         if not ok:
@@ -169,12 +181,12 @@ def serve_video(conn, cam):
 
         try:
             conn.sendall(struct.pack(">I", len(jpg)) + jpg.tobytes())
-        except:
-            break   # disconnect client
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            break
 
 
 ############################################################
-# MAIN
+# MAIN ENTRY
 ############################################################
 if __name__ == "__main__":
     threading.Thread(target=control_server, daemon=True).start()
