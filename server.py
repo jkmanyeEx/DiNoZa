@@ -11,13 +11,16 @@ CONTROL_PORT = 8001
 
 PERSON = 15
 
+# Load MobileNet SSD Model
 net = cv2.dnn.readNetFromCaffe(
     "MobileNetSSD_deploy.prototxt",
     "MobileNetSSD_deploy.caffemodel"
 )
 
-state = {"mode": "auto", "last_cmd": None}
-
+state = {
+    "mode": "auto",
+    "last_cmd": None
+}
 
 ############################################################
 # CONTROL SERVER
@@ -41,7 +44,7 @@ def control_handler(conn):
         while True:
             data = conn.recv(1024)
             if not data:
-                print("[CONTROL] Disconnected")
+                print("[CONTROL] Client disconnected")
                 break
 
             buffer += data
@@ -50,22 +53,24 @@ def control_handler(conn):
                 line = line.decode().strip()
 
                 if line.startswith("MODE"):
-                    state["mode"] = line.split()[1].lower()
-                    print("[CONTROL] Mode =", state["mode"])
+                    mode = line.split()[1].lower()
+                    state["mode"] = mode
+                    print("[CONTROL] Mode =", mode)
 
                 elif line.startswith("CMD"):
-                    state["last_cmd"] = line.split()[1].upper()
-                    print("[CONTROL] Manual CMD =", state["last_cmd"])
+                    cmd = line.split()[1].upper()
+                    state["last_cmd"] = cmd
+                    print("[CONTROL] Manual CMD =", cmd)
 
     finally:
         conn.close()
 
 
 ############################################################
-# VIDEO SERVER (Camera only initialized ONCE)
+# VIDEO SERVER (camera initialized once)
 ############################################################
 def video_server():
-    # ---- Initialize camera once ----
+    # Initialize camera only once
     cam = Picamera2()
     config = cam.create_video_configuration(
         main={"size": (640, 480), "format": "RGB888"},
@@ -75,7 +80,7 @@ def video_server():
     cam.start()
     print("[VIDEO] Camera started")
 
-    # ---- Socket ----
+    # Setup socket
     sock = socket.socket()
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((VIDEO_HOST, VIDEO_PORT))
@@ -86,12 +91,12 @@ def video_server():
         conn, addr = sock.accept()
         print("[VIDEO] Client connected:", addr)
         serve_video(conn, cam)
-        print("[VIDEO] Client disconnected")
         conn.close()
+        print("[VIDEO] Client disconnected")
 
 
 ############################################################
-# VIDEO STREAM HANDLE
+# HANDLE VIDEO STREAM TO ONE CLIENT
 ############################################################
 def serve_video(conn, cam):
     while True:
@@ -99,48 +104,73 @@ def serve_video(conn, cam):
         h, w = frame.shape[:2]
         mid_x = w // 2
 
-        # ---- Detection ----
+        ######################################################
+        # PERSON DETECTION
+        ######################################################
         blob = cv2.dnn.blobFromImage(
-            cv2.resize(frame, (300, 300)), 0.007843, (300, 300), 127.5
+            cv2.resize(frame, (300, 300)),
+            0.007843,
+            (300, 300),
+            127.5
         )
         net.setInput(blob)
-        det = net.forward()
+        detections = net.forward()
 
         candidates = []
+        selected_person = None
 
-        for i in range(det.shape[2]):
-            confidence = det[0, 0, i, 2]
-            cls_id = int(det[0, 0, i, 1])
+        # Loop over detections
+        for i in range(detections.shape[2]):
+            confidence = detections[0, 0, i, 2]
+            cls = int(detections[0, 0, i, 1])
 
-            if cls_id == PERSON and confidence > 0.5:
-                box = det[0, 0, i, 3:7] * np.array([w, h, w, h])
+            if cls == PERSON and confidence > 0.40:
+                # Box coords
+                box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
                 x1, y1, x2, y2 = box.astype(int)
 
-                # Draw box
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                # Draw bounding box
+                cv2.rectangle(frame, (x1, y1), (x2, y2),
+                              (0, 255, 0), 2)
 
+                # Person center
                 cx = (x1 + x2) // 2
                 cy = (y1 + y2) // 2
                 cv2.circle(frame, (cx, cy), 4, (0, 0, 255), -1)
 
+                # append candidate
                 candidates.append((abs(cx - mid_x), cx, cy))
 
-        # ---- Auto mode selection ----
-        if candidates:
-            candidates.sort(key=lambda x: x[0])
+        ######################################################
+        # AUTO MODE — pick closest to center
+        ######################################################
+        if state["mode"] == "auto" and candidates:
+            candidates.sort(key=lambda x: x[0])   # pick closest to center
             _, cx, cy = candidates[0]
+
+            # draw highlight circle
             cv2.circle(frame, (cx, cy), 12, (255, 0, 0), 2)
 
-        # ---- Send frame ----
-        ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            # AUTO direction logic
+            if cx < mid_x - 40:
+                print("[AUTO] LEFT")
+            elif cx > mid_x + 40:
+                print("[AUTO] RIGHT")
+            else:
+                print("[AUTO] CENTER")
 
-        if not ok: continue
+        ######################################################
+        # SEND FRAME
+        ######################################################
+        ok, jpg = cv2.imencode(".jpg", frame,
+                               [cv2.IMWRITE_JPEG_QUALITY, 80])
+        if not ok:
+            continue
 
-        packet = struct.pack(">I", len(jpg))
         try:
-            conn.sendall(packet + jpg.tobytes())
+            conn.sendall(struct.pack(">I", len(jpg)) + jpg.tobytes())
         except:
-            break
+            break   # disconnect client
 
 
 ############################################################
