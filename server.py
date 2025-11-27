@@ -3,16 +3,16 @@ import struct
 import threading
 import cv2
 import numpy as np
-from picamzero import Camera
+from picamera2 import Picamera2
 
 VIDEO_HOST = "0.0.0.0"
 VIDEO_PORT = 8000
 CONTROL_HOST = "0.0.0.0"
 CONTROL_PORT = 8001
 
-PERSON = 15
+PERSON = 15  # MobileNet SSD class ID for "person"
 
-# Load person detector
+# Load detection model
 net = cv2.dnn.readNetFromCaffe(
     "MobileNetSSD_deploy.prototxt",
     "MobileNetSSD_deploy.caffemodel"
@@ -23,6 +23,10 @@ state = {
     "last_cmd": None
 }
 
+
+# ------------------------
+# CONTROL SERVER
+# ------------------------
 def handle_control(conn):
     print("[CONTROL] Client connected")
     try:
@@ -33,20 +37,23 @@ def handle_control(conn):
                 break
 
             buffer += data
+
             while b"\n" in buffer:
                 line, buffer = buffer.split(b"\n", 1)
                 line = line.decode().strip()
 
                 if line.startswith("MODE"):
                     state["mode"] = line.split()[1].lower()
-                    print(f"[CONTROL] Mode set to {state['mode']}")
+                    print("[CONTROL] Mode =", state["mode"])
 
                 elif line.startswith("CMD"):
                     cmd = line.split()[1].upper()
                     state["last_cmd"] = cmd
-                    print(f"[CONTROL] Manual CMD = {cmd}")
-                    # TODO: GPIO / motor control integration
+                    print("[CONTROL] Manual CMD:", cmd)
+                    # TODO: integrate GPIO / motor here
+
     finally:
+        print("[CONTROL] Client disconnected")
         conn.close()
 
 
@@ -54,30 +61,39 @@ def start_control_server():
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.bind((CONTROL_HOST, CONTROL_PORT))
     sock.listen(1)
-    print(f"[CONTROL] Listening on port {CONTROL_PORT}")
+    print(f"[CONTROL] Listening on {CONTROL_PORT}")
 
     while True:
         conn, addr = sock.accept()
-        print("[CONTROL] connection from:", addr)
+        print("[CONTROL] Connection from", addr)
         threading.Thread(target=handle_control, args=(conn,), daemon=True).start()
 
 
+# ------------------------
+# VIDEO SERVER (PICAMERA2)
+# ------------------------
 def start_video_server():
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.bind((VIDEO_HOST, VIDEO_PORT))
     sock.listen(1)
-    print(f"[VIDEO] Listening on port {VIDEO_PORT}")
+    print(f"[VIDEO] Listening on {VIDEO_PORT}")
 
     conn, addr = sock.accept()
     print("[VIDEO] Client connected:", addr)
 
-    # Initialize the Pi Camera
-    cam = Camera(resolution=(640, 480), framerate=30)
+    # Initialize Picamera2
+    picam = Picamera2()
+    config = picam.create_video_configuration(
+        main={"size": (640, 480), "format": "RGB888"},
+        buffer_count=4
+    )
+    picam.configure(config)
+    picam.start()
 
     try:
         while True:
-            # Capture frame from PiCamZero
-            frame = cam.capture_array()
+            # Capture array from PiCam
+            frame = picam.capture_array()
 
             h, w = frame.shape[:2]
             mid_x = w // 2
@@ -85,9 +101,7 @@ def start_video_server():
             # ---- PERSON DETECTION ----
             blob = cv2.dnn.blobFromImage(
                 cv2.resize(frame, (300, 300)),
-                0.007843,
-                (300, 300),
-                127.5
+                0.007843, (300, 300), 127.5
             )
             net.setInput(blob)
             det = net.forward()
@@ -115,13 +129,15 @@ def start_video_server():
                 if state["mode"] == "auto":
                     if cx < mid_x - 40:
                         print("[AUTO] Move LEFT")
-                        # TODO send to motors
                     elif cx > mid_x + 40:
                         print("[AUTO] Move RIGHT")
                     else:
                         print("[AUTO] CENTERED")
 
-            # ---- Send frame to client ----
+                    # TODO: send GPIO/motor signal here
+
+            # ---- STREAM FRAME ----
+            # Compress as JPEG
             success, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
             if not success:
                 continue
@@ -130,6 +146,18 @@ def start_video_server():
             conn.sendall(struct.pack(">I", len(data)) + data)
 
     finally:
-        print("[VIDEO] Shutdown")
+        picam.stop()
         conn.close()
         sock.close()
+        print("[VIDEO] Shutdown")
+
+
+# ------------------------
+# MAIN
+# ------------------------
+if __name__ == "__main__":
+    # Control server runs in background
+    threading.Thread(target=start_control_server, daemon=True).start()
+
+    # Video server runs foreground
+    start_video_server()
