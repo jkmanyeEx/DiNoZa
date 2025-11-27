@@ -132,7 +132,8 @@ def serve_video(conn, cam):
             cv2.circle(frame, (cx, cy), 12, (255, 0, 0), 2)
 
         # ---- Send frame ----
-        ok, jpg = cv2.imencode(".jpg", frame, [80])
+        ok, jpg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+
         if not ok: continue
 
         packet = struct.pack(">I", len(jpg))
