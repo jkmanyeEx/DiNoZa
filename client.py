@@ -4,7 +4,7 @@ import threading
 import cv2
 import numpy as np
 
-SERVER_IP = "100.102.74.23"  # 👈 change to your Pi's IP
+SERVER_IP = "100.101.19.24"  # 👈 change to your Pi's IP
 VIDEO_PORT = 8000
 CONTROL_PORT = 8001
 
