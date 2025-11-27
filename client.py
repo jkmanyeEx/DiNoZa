@@ -3,113 +3,103 @@ import struct
 import threading
 import cv2
 import numpy as np
+import time
 
-SERVER_IP = "100.101.19.24"  # 👈 change to your Pi's IP
+SERVER_IP = "100.101.19.24"
 VIDEO_PORT = 8000
 CONTROL_PORT = 8001
 
-client_state = {
-    "mode": "auto"
-}
+running = True
+latest_frame = None
+frame_lock = threading.Lock()
 
-
+############################################################
+# VIDEO RECEIVER
+############################################################
 def video_receiver():
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    global latest_frame, running
+    print("[VIDEO] Connecting...")
+
+    sock = socket.socket()
     sock.connect((SERVER_IP, VIDEO_PORT))
-    print("[VIDEO] Connected to server")
+    print("[VIDEO] Connected")
 
-    data_buffer = b""
+    buffer = b""
 
-    try:
-        while True:
-            # we first need 4 bytes for the length
-            while len(data_buffer) < 4:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    print("[VIDEO] Disconnected from server")
-                    return
-                data_buffer += chunk
-
-            frame_len = struct.unpack(">I", data_buffer[:4])[0]
-            data_buffer = data_buffer[4:]
-
-            # now read the full frame
-            while len(data_buffer) < frame_len:
-                chunk = sock.recv(4096)
-                if not chunk:
-                    print("[VIDEO] Disconnected from server")
-                    return
-                data_buffer += chunk
-
-            frame_data = data_buffer[:frame_len]
-            data_buffer = data_buffer[frame_len:]
-
-            # decode JPEG
-            np_data = np.frombuffer(frame_data, dtype=np.uint8)
-            frame = cv2.imdecode(np_data, cv2.IMREAD_COLOR)
-
-            if frame is None:
-                continue
-
-            cv2.imshow("Pi Stream", frame)
-            key = cv2.waitKey(1) & 0xFF
-
-            # Handle keys locally (we just update some flag; actual sending is in control thread)
-            if key == ord('q'):
-                print("[CLIENT] Quit requested")
+    while running:
+        # read 4-byte header
+        while len(buffer) < 4:
+            data = sock.recv(4096)
+            if not data:
+                running = False
                 return
+            buffer += data
 
-            # store last key somewhere if needed
-    finally:
-        sock.close()
-        cv2.destroyAllWindows()
+        size = struct.unpack(">I", buffer[:4])[0]
+        buffer = buffer[4:]
+
+        # read frame
+        while len(buffer) < size:
+            data = sock.recv(4096)
+            if not data:
+                running = False
+                return
+            buffer += data
+
+        frame_data = buffer[:size]
+        buffer = buffer[size:]
+
+        img = cv2.imdecode(np.frombuffer(frame_data, np.uint8), cv2.IMREAD_COLOR)
+
+        with frame_lock:
+            latest_frame = img
 
 
-def control_sender():
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+############################################################
+# CONTROL SENDER (NO waitKey here!)
+############################################################
+def control_sender(send_queue):
+    sock = socket.socket()
     sock.connect((SERVER_IP, CONTROL_PORT))
-    print("[CONTROL] Connected to server")
+    print("[CONTROL] Connected")
 
-    try:
-        while True:
-            # Use OpenCV window for keyboard polling
-            key = cv2.waitKey(50) & 0xFF
-            if key == 255:  # no key
-                continue
+    while running:
+        if send_queue:
+            msg = send_queue.pop(0)
+            sock.sendall(msg.encode())
+        time.sleep(0.01)
 
-            # Quit
-            if key == ord('q'):
-                print("[CONTROL] Quit requested")
-                break
-
-            # Toggle mode
-            if key == ord('m'):
-                if client_state["mode"] == "auto":
-                    client_state["mode"] = "manual"
-                else:
-                    client_state["mode"] = "auto"
-                msg = f"MODE {client_state['mode'].upper()}\n"
-                print("[CONTROL] Sending:", msg.strip())
-                sock.sendall(msg.encode())
-
-            # WASD (manual movement)
-            if client_state["mode"] == "manual":
-                if key in (ord('w'), ord('a'), ord('s'), ord('d')):
-                    cmd = chr(key).upper()
-                    msg = f"CMD {cmd}\n"
-                    print("[CONTROL] Sending:", msg.strip())
-                    sock.sendall(msg.encode())
-
-    finally:
-        sock.close()
+    sock.close()
 
 
+############################################################
+# MAIN THREAD (handles keys safely)
+############################################################
 if __name__ == "__main__":
-    # Run both in parallel:
-    # - video_receiver: receiving and showing frames
-    # - control_sender: sending mode/WASD via keyboard
-    vr_thread = threading.Thread(target=video_receiver, daemon=True)
-    vr_thread.start()
+    send_queue = []
 
-    control_sender()
-    print("[CLIENT] Exiting")
+    threading.Thread(target=video_receiver, daemon=True).start()
+    threading.Thread(target=control_sender, args=(send_queue,), daemon=True).start()
+
+    print("[CLIENT] UI Loop starting")
+
+    while running:
+        with frame_lock:
+            frame = latest_frame
+
+        if frame is not None:
+            cv2.imshow("DiNoZa Client", frame)
+
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord('q'):
+            running = False
+            break
+        elif key == ord('m'):
+            send_queue.append("MODE AUTO\n")
+        elif key == ord('n'):
+            send_queue.append("MODE MANUAL\n")
+        elif key in (ord('w'), ord('a'), ord('s'), ord('d')):
+            send_queue.append(f"CMD {chr(key).upper()}\n")
+
+    cv2.destroyAllWindows()
