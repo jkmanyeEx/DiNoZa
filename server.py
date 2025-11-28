@@ -29,7 +29,7 @@ PERSON_CLASS_ID = 15
 # ============================================================
 state = {
     "mode": "manual",     # manual / auto
-    "command": "none",    # a,d,w,s
+    "command": "none",    # a,d,w,s,f
     "auto_lr": "none",    # left/right/center
     "auto_ud": "none",    # up/down/center
     "persons": [],        # list of [x1,y1,x2,y2]
@@ -40,26 +40,23 @@ state_lock = threading.Lock()
 
 
 # ============================================================
-#                MOTOR MANAGER (stub)
+#                MOTOR MANAGER (toggle shooting)
 # ============================================================
 class MotorManager:
 
-    def __init__(self):
-        self.motorController = MotorControl(pinmap={
-            "stepper1": {"dir": 5, "step": 6},     # PAN
-            "stepper2": {"dir": 13, "step": 19},   # TILT
-            "dc": {"pin": 20}                      # SHOOTER
-        }, step_count=200)
+    motorController = MotorControl(pinmap={
+        "stepper1": {"dir": 5, "step": 6},     # PAN
+        "stepper2": {"dir": 13, "step": 19},   # TILT
+        "dc": {"pin": 20}                      # SHOOTER
+    }, step_count=200)
 
-        self.PAN_STEP = 10
-        self.TILT_STEP = 10
-        self.STEP_SPEED = 0.001
+    PAN_STEP = 10
+    TILT_STEP = 10
+    STEP_SPEED = 0.001
 
-        self.shooting = False   # toggle state
+    shooting = False   # manual toggle state
 
-    # ---------------------------------------------------------
-    # DC CONTROL
-    # ---------------------------------------------------------
+    # ---------------- DC CONTROL ----------------
     def shoot_on(self):
         print("[MOTOR] SHOOT → ON (HIGH)")
         self.motorController.dc_on()
@@ -68,12 +65,9 @@ class MotorManager:
         print("[MOTOR] SHOOT → OFF (LOW)")
         self.motorController.dc_off()
 
-    # ---------------------------------------------------------
-    # MANUAL CONTROL  (TOGGLE SHOOT)
-    # ---------------------------------------------------------
+    # ---------------- MANUAL CONTROL (TOGGLE) ----------------
     def manual_control(self, key):
-
-        # ----- TOGGLE SHOOT ON/OFF -----
+        # toggle fire
         if key == "f":
             self.shooting = not self.shooting
             if self.shooting:
@@ -82,7 +76,7 @@ class MotorManager:
                 self.shoot_off()
             return
 
-        # ----- MOVEMENT -----
+        # movement
         if key == "a":
             print("[MOTOR] pan LEFT")
             self.motorController.rotate_stepper1(-self.PAN_STEP, self.STEP_SPEED)
@@ -99,47 +93,44 @@ class MotorManager:
             print("[MOTOR] tilt DOWN")
             self.motorController.rotate_stepper2(-self.TILT_STEP, self.STEP_SPEED)
 
-        # movement DOES NOT disable shooting in toggle mode
+        # if currently toggled shooting, keep it on
         if self.shooting:
-            self.shoot_on()   # ensure it stays ON
+            self.shoot_on()
 
-    # ---------------------------------------------------------
-    # AUTO CONTROL (unchanged)
-    # ---------------------------------------------------------
+    # ---------------- AUTO CONTROL ----------------
     def auto_control(self, lr, ud):
-        # ----- PAN -----
+        # PAN
         if lr == "left":
             self.motorController.rotate_stepper1(-self.PAN_STEP, self.STEP_SPEED)
         elif lr == "right":
             self.motorController.rotate_stepper1(self.PAN_STEP, self.STEP_SPEED)
 
-        # ----- TILT -----
+        # TILT
         if ud == "up":
             self.motorController.rotate_stepper2(self.TILT_STEP, self.STEP_SPEED)
         elif ud == "down":
             self.motorController.rotate_stepper2(-self.TILT_STEP, self.STEP_SPEED)
 
-        # ----- AUTO FIRE (only when centered) -----
+        # AUTO FIRE (only when centered)
         if lr == "center" and ud == "center":
             self.shoot_on()
         else:
-            # only turn off if NOT manually toggled on
+            # if user didn't force shooting ON manually, allow auto to stop it
             if not self.shooting:
                 self.shoot_off()
 
+
 motors = MotorManager()
+
 
 # ============================================================
 #                VIDEO STREAM THREAD (H.264)
 # ============================================================
-def video_thread():
+def video_thread(picam2: Picamera2):
     HOST = "0.0.0.0"
     PORT = 8000
 
-    picam2 = Picamera2()
-    config = picam2.create_video_configuration(main={"size": (640, 480)})
-    picam2.configure(config)
-    encoder = H264Encoder(bitrate=4000000)
+    encoder = H264Encoder(bitrate=4_000_000)
 
     print("[VIDEO] Waiting for video client...")
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -148,14 +139,30 @@ def video_thread():
     srv.listen(1)
 
     conn, addr = srv.accept()
-    print(f"[VIDEO] Client connected:", addr)
+    print("[VIDEO] Client connected:", addr)
 
-    output = FileOutput(conn)
-    picam2.start_recording(encoder, output)
-    print("[VIDEO] Streaming now...")
+    # buffered stream wrapping the socket
+    sock_file = conn.makefile("wb")
+    output = FileOutput(sock_file)
 
-    while True:
-        time.sleep(1)
+    try:
+        picam2.start_encoder(encoder, output)
+        print("[VIDEO] H.264 encoder started")
+
+        while True:
+            time.sleep(1)
+
+    except Exception as e:
+        print("[VIDEO] ERROR:", e)
+
+    finally:
+        try:
+            picam2.stop_encoder()
+        except Exception:
+            pass
+        sock_file.close()
+        conn.close()
+        print("[VIDEO] encoder stopped, client socket closed")
 
 
 # ============================================================
@@ -187,20 +194,25 @@ def control_thread():
                     state["mode"] = "auto"
                 elif data == "manual":
                     state["mode"] = "manual"
-                elif data in ["a", "d", "w", "s"]:
+                elif data in ["a", "d", "w", "s", "f"]:
                     state["command"] = data
                 else:
                     print("[CONTROL] unknown:", data)
 
-            # apply motor action
-            with state_lock:
-                if state["mode"] == "manual":
-                    motors.manual_control(state["command"])
-                else:
-                    motors.auto_control(state["auto_lr"], state["auto_ud"])
+                mode = state["mode"]
+                cmd = state["command"]
+                auto_lr = state["auto_lr"]
+                auto_ud = state["auto_ud"]
 
-        except:
-            pass
+            # outside lock
+            if mode == "manual":
+                motors.manual_control(cmd)
+            else:
+                motors.auto_control(auto_lr, auto_ud)
+
+        except Exception as e:
+            print("[CONTROL] error:", e)
+            continue
 
 
 # ============================================================
@@ -223,21 +235,24 @@ def metadata_thread():
         with state_lock:
             meta = json.dumps(state).encode()
 
-        conn.sendall(struct.pack(">I", len(meta)) + meta)
+        try:
+            conn.sendall(struct.pack(">I", len(meta)) + meta)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            print("[META] client disconnected")
+            break
+
         time.sleep(0.03)  # ~33 FPS metadata
 
 
 # ============================================================
-#                DETECTION THREAD
+#                DETECTION THREAD (shared camera)
 # ============================================================
-def detection_thread():
-    picam = Picamera2()
-    config = picam.create_video_configuration(main={"size": (640, 480)})
-    picam.configure(config)
-    picam.start()
-
+def detection_thread(picam2: Picamera2):
     while True:
-        frame = picam.capture_array()
+        # Picamera2 gives BGRA by default, we need BGR for DNN
+        frame = picam2.capture_array()
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+
         (h, w) = frame.shape[:2]
 
         blob = cv2.dnn.blobFromImage(
@@ -304,12 +319,18 @@ def detection_thread():
 #                MAIN
 # ============================================================
 if __name__ == "__main__":
-    threading.Thread(target=video_thread, daemon=True).start()
+    # Single shared camera instance
+    picam2 = Picamera2()
+    config = picam2.create_video_configuration(main={"size": (640, 480)})
+    picam2.configure(config)
+    picam2.start()  # start camera once
+
+    threading.Thread(target=video_thread, args=(picam2,), daemon=True).start()
     threading.Thread(target=control_thread, daemon=True).start()
     threading.Thread(target=metadata_thread, daemon=True).start()
-    threading.Thread(target=detection_thread, daemon=True).start()
+    threading.Thread(target=detection_thread, args=(picam2,), daemon=True).start()
 
-    print("[SERVER] all subsystems online (H.264 + JSON + detection + control)")
+    print("[SERVER] all subsystems online (H.264 + JSON + detection + control + motors)")
 
     while True:
         time.sleep(1)
