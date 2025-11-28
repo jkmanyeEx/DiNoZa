@@ -1,146 +1,194 @@
-import cv2
-import json
+#!/usr/bin/env python3
 import socket
-import struct
 import threading
+import struct
+import json
+import cv2
+import numpy as np
+import time
 
-PI_IP = "100.101.19.24"  # change to your Pi's IP
+
+VIDEO_HOST = "100.101.19.24"
+CONTROL_HOST = "100.101.19.24"
+META_HOST = "100.101.19.24"
+
 VIDEO_PORT = 8000
 CONTROL_PORT = 8001
 META_PORT = 8002
 
+
+# =============================================================
+# GLOBAL STATE FROM SERVER
+# =============================================================
 state = {
     "mode": "manual",
     "command": "none",
+    "shoot": False,
     "auto_lr": "none",
     "auto_ud": "none",
     "persons": [],
-    "selected": -1,
-    "shooter": False,
+    "selected": -1
 }
+
 state_lock = threading.Lock()
 
 
-def recv_all(sock, length):
-    buf = b""
-    while len(buf) < length:
-        chunk = sock.recv(length - len(buf))
-        if not chunk:
-            return None
-        buf += chunk
-    return buf
-
-
+# =============================================================
+# METADATA RECEIVER
+# =============================================================
 def metadata_thread():
     global state
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.connect((PI_IP, META_PORT))
-    print("[META] connected")
-
     while True:
-        hdr = sock.recv(4)
-        if not hdr:
-            print("[META] header lost")
-            break
-
-        length = struct.unpack(">I", hdr)[0]
-        payload = recv_all(sock, length)
-        if payload is None:
-            print("[META] payload lost")
-            break
-
         try:
-            obj = json.loads(payload.decode())
+            sock = socket.socket()
+            sock.connect((META_HOST, META_PORT))
+            print("[META] Connected to server")
+
+            while True:
+                header = sock.recv(4)
+                if not header:
+                    break
+
+                size = struct.unpack(">I", header)[0]
+                payload = sock.recv(size)
+
+                with state_lock:
+                    state = json.loads(payload.decode())
+
         except Exception as e:
-            print("[META] JSON error:", e)
-            continue
-
-        with state_lock:
-            state = obj
-
-
-def draw_hud(frame):
-    with state_lock:
-        persons = state.get("persons", [])
-        selected = state.get("selected", -1)
-        mode = state.get("mode", "manual")
-        cmd = state.get("command", "none")
-        auto_lr = state.get("auto_lr", "none")
-        auto_ud = state.get("auto_ud", "none")
-        shooter = bool(state.get("shooter", False))
-
-    # draw bounding boxes
-    for i, p in enumerate(persons):
-        x1, y1, x2, y2 = p
-        color = (0, 255, 0) if i != selected else (0, 0, 255)
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
-    # draw target center dot
-    if 0 <= selected < len(persons):
-        x1, y1, x2, y2 = persons[selected]
-        cx = (x1 + x2) // 2
-        cy = (y1 + y2) // 2
-        cv2.circle(frame, (cx, cy), 6, (0, 0, 255), -1)
-
-    # HUD text
-    cv2.putText(frame, f"MODE: {mode}", (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
-    cv2.putText(frame, f"CMD: {cmd}", (10, 60),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
-    cv2.putText(frame, f"AUTO LR: {auto_lr}", (10, 90),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-    cv2.putText(frame, f"AUTO UD: {auto_ud}", (10, 120),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 200, 100), 2)
-
-    shoot_text = "ON" if shooter else "OFF"
-    shoot_color = (0, 0, 255) if shooter else (200, 200, 200)
-    cv2.putText(frame, f"SHOOT: {shoot_text}", (10, 150),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, shoot_color, 2)
+            print("[META ERROR]", e)
+            time.sleep(1)
+        finally:
+            try:
+                sock.close()
+            except:
+                pass
 
 
-if __name__ == "__main__":
-    # metadata
-    threading.Thread(target=metadata_thread, daemon=True).start()
+# =============================================================
+# CONTROL SENDER
+# =============================================================
+def control_thread():
+    while True:
+        try:
+            sock = socket.socket()
+            sock.connect((CONTROL_HOST, CONTROL_PORT))
+            print("[CONTROL] Connected to server")
 
-    # control socket
-    control_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    control_sock.connect((PI_IP, CONTROL_PORT))
-    print("[CONTROL] connected")
+            while True:
+                key = cv2.waitKey(1) & 0xFF
 
-    # video stream
-    cap = cv2.VideoCapture(f"tcp://{PI_IP}:{VIDEO_PORT}")
-    if not cap.isOpened():
-        print("[VIDEO] failed to connect")
-        exit(1)
-    print("[VIDEO] connected")
+                # WASD manual movement
+                if key in [ord("w"), ord("a"), ord("s"), ord("d")]:
+                    sock.send(chr(key).encode())
 
-    print("[CLIENT] running (q=quit, m=manual, o=auto, WASD move, f=fire toggle)")
+                # toggle shooter
+                if key == ord("f"):
+                    sock.send(b"f")
+
+                # mode switch
+                if key == ord("m"):    # manual
+                    sock.send(b"manual")
+                if key == ord("o"):    # auto
+                    sock.send(b"auto")
+
+                # quit
+                if key == ord("q"):
+                    exit(0)
+
+                time.sleep(0.01)
+
+        except Exception as e:
+            print("[CONTROL ERROR]", e)
+            time.sleep(1)
+        finally:
+            try:
+                sock.close()
+            except:
+                pass
+
+
+# =============================================================
+# VIDEO RECEIVER
+# =============================================================
+def video_thread():
+    """Receives H.264 stream → decode → HUD draw → show."""
+    import av   # PyAV required (pip install av)
 
     while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("[VIDEO] stream ended")
-            break
+        try:
+            sock = socket.socket()
+            sock.connect((VIDEO_HOST, VIDEO_PORT))
+            print("[VIDEO] Connected to server")
 
-        draw_hud(frame)
-        cv2.imshow("DiNoZa HUD", frame)
+            container = av.open(sock.makefile("rb"))
 
-        key = cv2.waitKey(1) & 0xFF
+            for frame in container.decode(video=0):
+                img = frame.to_ndarray(format="bgr24")
 
-        if key == ord("q"):
-            break
+                # flip to match detection orientation
+                img = cv2.flip(img, 1)
 
-        # mode switch
-        if key == ord("m"):
-            control_sock.sendall(b"manual\n")
-        elif key == ord("o"):
-            control_sock.sendall(b"auto\n")
+                # ================= HUD =================
+                with state_lock:
+                    st = state.copy()
 
-        # movement + fire
-        elif key in [ord("a"), ord("d"), ord("w"), ord("s"), ord("f")]:
-            control_sock.sendall(f"{chr(key)}\n".encode())
+                # Show mode
+                cv2.putText(img, f"Mode: {st['mode']}",
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.8, (255, 255, 255), 2)
 
-    cap.release()
-    control_sock.close()
-    cv2.destroyAllWindows()
+                # Show command
+                cv2.putText(img, f"Cmd: {st['command']}",
+                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.8, (200, 200, 200), 2)
+
+                # Shooter status
+                color = (0, 255, 0) if st["shoot"] else (0, 0, 255)
+                cv2.putText(img, f"Shooter: {'ON' if st['shoot'] else 'OFF'}",
+                            (10, 90), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.8, color, 2)
+
+                # Auto direction
+                cv2.putText(img, f"Auto-LR: {st['auto_lr']}",
+                            (10, 120), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.8, (255, 255, 0), 2)
+
+                cv2.putText(img, f"Auto-UD: {st['auto_ud']}",
+                            (10, 150), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.8, (255, 255, 0), 2)
+
+                # ================= Draw Persons =================
+                for i, p in enumerate(st["persons"]):
+                    x1, y1, x2, y2 = p
+                    color = (0, 255, 0) if i == st["selected"] else (0, 0, 255)
+                    cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+
+                cv2.imshow("DiNoZa HUD", img)
+
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    exit(0)
+
+        except Exception as e:
+            print("[VIDEO ERROR]", e)
+            time.sleep(1)
+        finally:
+            try:
+                sock.close()
+            except:
+                pass
+
+
+# =============================================================
+# MAIN
+# =============================================================
+if __name__ == "__main__":
+    print("[CLIENT] Starting all threads")
+
+    threading.Thread(target=metadata_thread, daemon=True).start()
+    threading.Thread(target=control_thread, daemon=True).start()
+    threading.Thread(target=video_thread, daemon=True).start()
+
+    while True:
+        time.sleep(1)

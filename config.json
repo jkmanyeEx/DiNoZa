@@ -1,7 +1,12 @@
 {
-  "motors": {
-    "stepper1_enabled": true,
-    "stepper2_enabled": false,
-    "dc_enabled": false
-  }
+    "use_stepper1": true,
+    "use_stepper2": false,
+    "use_dc": true,
+
+    "stepper1": { "dir": 5, "step": 6 },
+    "stepper2": { "dir": 13, "step": 19 },
+    "dc": { "pin": 20 },
+
+    "step_size": 5,
+    "speed": 0.001
 }
