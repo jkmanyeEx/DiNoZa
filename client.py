@@ -4,7 +4,7 @@ import socket
 import struct
 import threading
 
-PI_IP = "100.97.150.114"  # change to your Pi's IP
+PI_IP = "100.101.19.24"  # change to your Pi's IP
 VIDEO_PORT = 8000
 CONTROL_PORT = 8001
 META_PORT = 8002
