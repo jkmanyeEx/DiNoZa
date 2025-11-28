@@ -4,7 +4,7 @@ import socket
 import struct
 import threading
 
-PI_IP = "100.97.150.114"  # change if needed
+PI_IP = "100.97.150.114"  # change to your Pi's IP
 VIDEO_PORT = 8000
 CONTROL_PORT = 8001
 META_PORT = 8002
@@ -16,6 +16,7 @@ state = {
     "auto_ud": "none",
     "persons": [],
     "selected": -1,
+    "shooter": False,
 }
 state_lock = threading.Lock()
 
@@ -67,14 +68,15 @@ def draw_hud(frame):
         cmd = state.get("command", "none")
         auto_lr = state.get("auto_lr", "none")
         auto_ud = state.get("auto_ud", "none")
+        shooter = bool(state.get("shooter", False))
 
-    # draw person boxes
+    # draw bounding boxes
     for i, p in enumerate(persons):
         x1, y1, x2, y2 = p
         color = (0, 255, 0) if i != selected else (0, 0, 255)
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-    # selected center dot
+    # draw target center dot
     if 0 <= selected < len(persons):
         x1, y1, x2, y2 = persons[selected]
         cx = (x1 + x2) // 2
@@ -91,9 +93,14 @@ def draw_hud(frame):
     cv2.putText(frame, f"AUTO UD: {auto_ud}", (10, 120),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 200, 100), 2)
 
+    shoot_text = "ON" if shooter else "OFF"
+    shoot_color = (0, 0, 255) if shooter else (200, 200, 200)
+    cv2.putText(frame, f"SHOOT: {shoot_text}", (10, 150),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, shoot_color, 2)
+
 
 if __name__ == "__main__":
-    # start metadata receiver
+    # metadata
     threading.Thread(target=metadata_thread, daemon=True).start()
 
     # control socket
@@ -108,7 +115,7 @@ if __name__ == "__main__":
         exit(1)
     print("[VIDEO] connected")
 
-    print("[CLIENT] running")
+    print("[CLIENT] running (q=quit, m=manual, o=auto, WASD move, f=fire toggle)")
 
     while True:
         ret, frame = cap.read()
@@ -129,7 +136,8 @@ if __name__ == "__main__":
             control_sock.sendall(b"manual\n")
         elif key == ord("o"):
             control_sock.sendall(b"auto\n")
-        # movement + fire, one char + newline
+
+        # movement + fire
         elif key in [ord("a"), ord("d"), ord("w"), ord("s"), ord("f")]:
             control_sock.sendall(f"{chr(key)}\n".encode())
 

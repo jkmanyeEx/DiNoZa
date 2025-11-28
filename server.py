@@ -5,12 +5,12 @@ import json
 import struct
 import time
 
+import cv2
+import numpy as np
+
 from picamera2 import Picamera2
 from picamera2.encoders import H264Encoder
 from picamera2.outputs import FileOutput
-
-import cv2
-import numpy as np
 
 from motor_control import MotorControl
 
@@ -28,108 +28,45 @@ PERSON_CLASS_ID = 15
 #                SHARED STATE
 # ============================================================
 state = {
-    "mode": "manual",
-    "command": "none",
-    "auto_lr": "none",
-    "auto_ud": "none",
-    "persons": [],
-    "selected": -1,
+    "mode": "manual",      # "manual" / "auto"
+    "command": "none",     # last manual command
+    "auto_lr": "none",     # "left"/"right"/"center"/"none"
+    "auto_ud": "none",     # "up"/"down"/"center"/"none"
+    "persons": [],         # [[x1,y1,x2,y2], ...]
+    "selected": -1,        # index of target
+    "shooter": False,      # True if MOSFET DC ON
 }
 state_lock = threading.Lock()
 
 
 def to_python(obj):
-    """Recursively convert numpy types → pure Python for JSON."""
+    """Recursively convert numpy → pure Python for JSON."""
+    import numpy as np
+
     if isinstance(obj, (np.integer,)):
         return int(obj)
     if isinstance(obj, (np.floating,)):
         return float(obj)
     if isinstance(obj, np.ndarray):
         return obj.tolist()
-    if isinstance(obj, list):
+    if isinstance(obj, (list, tuple)):
         return [to_python(x) for x in obj]
     if isinstance(obj, dict):
-        return {k: to_python(v) for v in obj.items()}
+        return {k: to_python(v) for k, v in obj.items()}
     return obj
 
 
 # ============================================================
-#                MOTOR MANAGER (toggle shooting)
+#                MOTOR CONTROL
 # ============================================================
-class MotorManager:
-    motorController = MotorControl(
-        pinmap={
-            "stepper1": {"dir": 5, "step": 6},
-            "stepper2": {"dir": 13, "step": 19},
-            "dc": {"pin": 20},
-        },
-        step_count=200,
-    )
-
-    PAN_STEP = 10
-    TILT_STEP = 10
-    SPEED = 0.001
-
-    shooting = False  # manual toggle
-
-    def shoot_on(self):
-        print("[MOTOR] SHOOT → ON")
-        self.motorController.dc_on()
-
-    def shoot_off(self):
-        print("[MOTOR] SHOOT → OFF")
-        self.motorController.dc_off()
-
-    def manual_control(self, key: str):
-        # toggle shooting
-        if key == "f":
-            self.shooting = not self.shooting
-            if self.shooting:
-                self.shoot_on()
-            else:
-                self.shoot_off()
-            return
-
-        if key == "a":
-            print("[MOTOR] PAN LEFT")
-            self.motorController.rotate_stepper1(-self.PAN_STEP, self.SPEED)
-        elif key == "d":
-            print("[MOTOR] PAN RIGHT")
-            self.motorController.rotate_stepper1(self.PAN_STEP, self.SPEED)
-        elif key == "w":
-            print("[MOTOR] TILT UP")
-            self.motorController.rotate_stepper2(self.TILT_STEP, self.SPEED)
-        elif key == "s":
-            print("[MOTOR] TILT DOWN")
-            self.motorController.rotate_stepper2(-self.TILT_STEP, self.SPEED)
-
-        # if toggle on, keep DC high
-        if self.shooting:
-            self.shoot_on()
-
-    def auto_control(self, lr: str, ud: str):
-        # horizontal
-        if lr == "left":
-            self.motorController.rotate_stepper1(-self.PAN_STEP, self.SPEED)
-        elif lr == "right":
-            self.motorController.rotate_stepper1(self.PAN_STEP, self.SPEED)
-
-        # vertical
-        if ud == "up":
-            self.motorController.rotate_stepper2(self.TILT_STEP, self.SPEED)
-        elif ud == "down":
-            self.motorController.rotate_stepper2(-self.TILT_STEP, self.SPEED)
-
-        # auto fire only when centered
-        if lr == "center" and ud == "center":
-            self.shoot_on()
-        else:
-            # if user hasn't forced shooting ON manually, allow auto to stop it
-            if not self.shooting:
-                self.shoot_off()
-
-
-motors = MotorManager()
+# TODO: change pins to your actual wiring
+motors = MotorControl(
+    pinmap={
+        "stepper1": [5, 6, 13, 19],      # L298N IN1..IN4 (pan)
+        "stepper2": [12, 16, 20, 21],    # L298N IN1..IN4 (tilt)
+        "dc": {"pin": 23},               # MOSFET gate pin
+    }
+)
 
 
 # ============================================================
@@ -158,7 +95,7 @@ def video_thread(picam2: Picamera2):
         print("[VIDEO] H.264 encoder started")
 
         while True:
-            time.sleep(1)
+            time.sleep(1)  # encoder runs in background
 
     except Exception as e:
         print("[VIDEO ERROR]", e)
@@ -175,7 +112,6 @@ def video_thread(picam2: Picamera2):
 
 # ============================================================
 #                CONTROL THREAD (client → Pi)
-#                (line-based protocol: "a\n", "auto\n")
 # ============================================================
 def control_thread():
     HOST = "0.0.0.0"
@@ -195,6 +131,7 @@ def control_thread():
     while True:
         data = conn.recv(32)
         if not data:
+            print("[CONTROL] disconnected")
             break
 
         buffer += data.decode(errors="ignore")
@@ -208,23 +145,20 @@ def control_thread():
             with state_lock:
                 if cmd == "auto":
                     state["mode"] = "auto"
-                    print("[CONTROL] mode → auto")
+                    print("[CONTROL] mode -> auto")
                 elif cmd == "manual":
                     state["mode"] = "manual"
-                    print("[CONTROL] mode → manual")
+                    print("[CONTROL] mode -> manual")
                 elif cmd in ["a", "d", "w", "s", "f"]:
                     state["command"] = cmd
                     print("[CONTROL] cmd:", cmd)
 
                 mode = state["mode"]
                 command = state["command"]
-                lr = state["auto_lr"]
-                ud = state["auto_ud"]
 
-            if mode == "manual":
+            # act on motors (manual only)
+            if mode == "manual" and command in ["a", "d", "w", "s", "f"]:
                 motors.manual_control(command)
-            else:
-                motors.auto_control(lr, ud)
 
 
 # ============================================================
@@ -245,12 +179,15 @@ def metadata_thread():
 
     while True:
         with state_lock:
+            # sync shooter state from motor controller
+            state["shooter"] = bool(motors.dc.state)
             payload = to_python(state)
 
         try:
             meta = json.dumps(payload).encode()
         except Exception as e:
             print("[META] JSON error:", e)
+            time.sleep(0.1)
             continue
 
         try:
@@ -259,7 +196,7 @@ def metadata_thread():
             print("[META] disconnected:", e)
             break
 
-        time.sleep(0.03)
+        time.sleep(0.03)  # ~33 Hz
 
 
 # ============================================================
@@ -267,20 +204,34 @@ def metadata_thread():
 # ============================================================
 def detection_thread(picam2: Picamera2):
     while True:
-        frame = picam2.capture_array("main")  # RGB888 from config
-        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        frame = picam2.capture_array("main")  # RGB888
 
-        # optional: slight brightness boost to help SSD
-        frame = cv2.convertScaleAbs(frame, alpha=1.2, beta=10)
+        if frame is None or frame.size == 0:
+            continue
+
+        if frame.shape[2] == 4:
+            frame = frame[:, :, :3]
+
+        # RGB -> BGR for OpenCV
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
         h, w = frame.shape[:2]
 
+        # Adaptive brightness normalization
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        mean_val = gray.mean()
+        if mean_val < 60:
+            frame = cv2.convertScaleAbs(frame, alpha=1.8, beta=40)
+        elif mean_val < 90:
+            frame = cv2.convertScaleAbs(frame, alpha=1.5, beta=20)
+
         blob = cv2.dnn.blobFromImage(
             cv2.resize(frame, (300, 300)),
-            0.007843,
-            (300, 300),
-            127.5,
+            scalefactor=0.007843,
+            size=(300, 300),
+            mean=127.5,
         )
+
         net.setInput(blob)
         detections = net.forward()
 
@@ -289,9 +240,19 @@ def detection_thread(picam2: Picamera2):
         for i in range(detections.shape[2]):
             conf = float(detections[0, 0, i, 2])
             cls = int(detections[0, 0, i, 1])
-            if cls == PERSON_CLASS_ID and conf > 0.45:
+
+            if cls == PERSON_CLASS_ID and conf > 0.15:
                 box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
                 x1, y1, x2, y2 = [int(v) for v in box]
+
+                # expand box slightly
+                pad_x = int((x2 - x1) * 0.1)
+                pad_y = int((y2 - y1) * 0.1)
+                x1 = max(0, x1 - pad_x)
+                y1 = max(0, y1 - pad_y)
+                x2 = min(w, x2 + pad_x)
+                y2 = min(h, y2 + pad_y)
+
                 persons.append([x1, y1, x2, y2])
 
         with state_lock:
@@ -301,39 +262,54 @@ def detection_thread(picam2: Picamera2):
                 state["selected"] = -1
                 state["auto_lr"] = "none"
                 state["auto_ud"] = "none"
-                continue
+            else:
+                cx, cy = w // 2, h // 2
 
-            cx, cy = w // 2, h // 2
+                # pick nearest to horizontal center
+                dlist = []
+                for idx, (x1, y1, x2, y2) in enumerate(persons):
+                    px = (x1 + x2) // 2
+                    dlist.append((abs(px - cx), idx))
 
-            # select closest to center in X
-            d_list = []
-            for idx, (x1, y1, x2, y2) in enumerate(persons):
+                _, sel = min(dlist)
+                sel = int(sel)
+                state["selected"] = sel
+
+                x1, y1, x2, y2 = persons[sel]
                 px = (x1 + x2) // 2
-                d_list.append((abs(px - cx), idx))
+                py = (y1 + y2) // 2
 
-            _, sel_idx = min(d_list)
-            sel_idx = int(sel_idx)
-            state["selected"] = sel_idx
+                # LR control
+                if px < cx - 64:
+                    state["auto_lr"] = "left"
+                elif px > cx + 64:
+                    state["auto_lr"] = "right"
+                else:
+                    state["auto_lr"] = "center"
 
-            x1, y1, x2, y2 = persons[sel_idx]
-            px = int((x1 + x2) // 2)
-            py = int((y1 + y2) // 2)
+                # UD control
+                if py < cy - 48:
+                    state["auto_ud"] = "up"
+                elif py > cy + 48:
+                    state["auto_ud"] = "down"
+                else:
+                    state["auto_ud"] = "center"
 
-            # auto LR
-            if px < cx - 40:
-                state["auto_lr"] = "left"
-            elif px > cx + 40:
-                state["auto_lr"] = "right"
-            else:
-                state["auto_lr"] = "center"
 
-            # auto UD
-            if py < cy - 40:
-                state["auto_ud"] = "up"
-            elif py > cy + 40:
-                state["auto_ud"] = "down"
-            else:
-                state["auto_ud"] = "center"
+# ============================================================
+#                AUTO CONTROL LOOP
+# ============================================================
+def auto_loop():
+    while True:
+        time.sleep(0.05)  # 20 Hz loop
+
+        with state_lock:
+            if state["mode"] != "auto":
+                continue
+            lr = state["auto_lr"]
+            ud = state["auto_ud"]
+
+        motors.auto_control(lr, ud)
 
 
 # ============================================================
@@ -351,7 +327,14 @@ if __name__ == "__main__":
     threading.Thread(target=control_thread, daemon=True).start()
     threading.Thread(target=metadata_thread, daemon=True).start()
     threading.Thread(target=detection_thread, args=(picam2,), daemon=True).start()
+    threading.Thread(target=auto_loop, daemon=True).start()
 
-    print("[SERVER] Online")
-    while True:
-        time.sleep(1)
+    print("[SERVER] Online (video + control + meta + detect + auto)")
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n[SERVER] Shutting down...")
+        motors.cleanup()
+        picam2.stop()
