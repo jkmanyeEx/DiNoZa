@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-#
 import socket
 import threading
 import json
 import struct
 import time
-
 import cv2
 import numpy as np
 
@@ -17,245 +15,226 @@ from motor_control import MotorControl
 
 
 # ============================================================
-#                PERSON DETECTOR (MobileNet SSD)
+#   MobileNetSSD PERSON DETECTOR
 # ============================================================
-PROTOTXT = "./model/MobileNetSSD_deploy.prototxt"
-MODEL = "./model/MobileNetSSD_deploy.caffemodel"
-net = cv2.dnn.readNetFromCaffe(PROTOTXT, MODEL)
-PERSON_CLASS_ID = 15
+MODEL_DIR = "./model"
+PROTOTXT = f"{MODEL_DIR}/MobileNetSSD_deploy.prototxt"
+CAFFE_MODEL = f"{MODEL_DIR}/MobileNetSSD_deploy.caffemodel"
+
+net = cv2.dnn.readNetFromCaffe(PROTOTXT, CAFFE_MODEL)
+PERSON_ID = 15
 
 
 # ============================================================
-#                SHARED STATE
+#   SHARED STATE
 # ============================================================
 state = {
-    "mode": "manual",      # "manual" / "auto"
-    "command": "none",     # last manual command
-    "auto_lr": "none",     # "left"/"right"/"center"/"none"
-    "auto_ud": "none",     # "up"/"down"/"center"/"none"
-    "persons": [],         # [[x1,y1,x2,y2], ...]
-    "selected": -1,        # index of target
-    "shooter": False,      # True if MOSFET DC ON
+    "mode": "manual",
+    "command": "none",
+    "auto_lr": "none",
+    "auto_ud": "none",
+    "shooter": False,
+    "persons": [],
+    "selected": -1
 }
+
 state_lock = threading.Lock()
 
 
+# ============================================================
+#   TYPE SANITIZER (Fix int64 JSON errors)
+# ============================================================
 def to_python(obj):
-    """Recursively convert numpy → pure Python for JSON."""
-    import numpy as np
-
-    if isinstance(obj, (np.integer,)):
-        return int(obj)
-    if isinstance(obj, (np.floating,)):
-        return float(obj)
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    if isinstance(obj, (list, tuple)):
-        return [to_python(x) for x in obj]
+    """Convert numpy and non-serializable types to Python built-ins."""
     if isinstance(obj, dict):
-        return {k: to_python(v) for k, v in obj.items()}
+        return {str(k): to_python(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [to_python(i) for i in obj]
+    if isinstance(obj, (np.int32, np.int64, np.float32, np.float64)):
+        return obj.item()
     return obj
 
 
 # ============================================================
-#                MOTOR CONTROL
+#   MOTOR MANAGER
 # ============================================================
-# TODO: change pins to your actual wiring
-motors = MotorControl(
-    pinmap={
-        "stepper1": [5, 6, 13, 19],      # L298N IN1..IN4 (pan)
-        "stepper2": [12, 16, 20, 21],    # L298N IN1..IN4 (tilt)
-        "dc": {"pin": 23},               # MOSFET gate pin
-    }
-)
+motors = MotorControl({
+    "stepper1": [5, 6, 13, 19],      # L298N pins for PAN
+    "stepper2": [12, 16, 20, 21],    # L298N pins for TILT
+    "dc": {"pin": 23}                # MOSFET gate pin for shooter
+})
 
 
 # ============================================================
-#                VIDEO STREAM THREAD (H.264)
+#   VIDEO STREAM THREAD (Persistent)
 # ============================================================
-def video_thread(picam2: Picamera2):
-    HOST = "0.0.0.0"
-    PORT = 8000
+def video_thread(picam2):
+    HOST, PORT = "0.0.0.0", 8000
 
     encoder = H264Encoder(bitrate=4_000_000)
 
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((HOST, PORT))
-    srv.listen(1)
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((HOST, PORT))
+    server.listen(1)
 
-    print("[VIDEO] Waiting for client...")
-    conn, addr = srv.accept()
-    print("[VIDEO] Client connected:", addr)
+    print("[VIDEO] Ready on port 8000")
 
-    sock_file = conn.makefile("wb")
-    output = FileOutput(sock_file)
+    while True:
+        print("[VIDEO] Waiting for client...")
+        conn, addr = server.accept()
+        print(f"[VIDEO] Client connected: {addr}")
 
-    try:
-        picam2.start_encoder(encoder, output)
-        print("[VIDEO] H.264 encoder started")
+        sock_file = conn.makefile("wb")
+        output = FileOutput(sock_file)
 
-        while True:
-            time.sleep(1)  # encoder runs in background
-
-    except Exception as e:
-        print("[VIDEO ERROR]", e)
-
-    finally:
         try:
-            picam2.stop_encoder()
-        except Exception:
-            pass
-        sock_file.close()
-        conn.close()
-        print("[VIDEO] Closed")
+            picam2.start_encoder(encoder, output)
+            print("[VIDEO] Encoder started")
+
+            while True:
+                time.sleep(0.25)
+
+        except Exception as e:
+            print("[VIDEO ERROR]", e)
+
+        finally:
+            print("[VIDEO] Cleaning encoder...")
+            try:
+                picam2.stop_encoder()
+            except:
+                pass
+            sock_file.close()
+            conn.close()
+            print("[VIDEO] Client disconnected")
 
 
 # ============================================================
-#                CONTROL THREAD (client → Pi)
+#   CONTROL THREAD (Persistent)
 # ============================================================
 def control_thread():
-    HOST = "0.0.0.0"
-    PORT = 8001
 
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((HOST, PORT))
-    srv.listen(1)
+    HOST, PORT = "0.0.0.0", 8001
 
-    print("[CONTROL] Waiting...")
-    conn, addr = srv.accept()
-    print("[CONTROL] Client connected:", addr)
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((HOST, PORT))
+    server.listen(1)
 
-    buffer = ""
+    print("[CONTROL] Ready on port 8001")
 
     while True:
-        data = conn.recv(32)
-        if not data:
-            print("[CONTROL] disconnected")
-            break
+        print("[CONTROL] Waiting for client...")
+        conn, addr = server.accept()
+        print(f"[CONTROL] Client connected: {addr}")
 
-        buffer += data.decode(errors="ignore")
+        buffer = ""
 
-        while "\n" in buffer:
-            line, buffer = buffer.split("\n", 1)
-            cmd = line.strip()
-            if not cmd:
-                continue
+        try:
+            while True:
+                data = conn.recv(32)
+                if not data:
+                    break
 
-            with state_lock:
-                if cmd == "auto":
-                    state["mode"] = "auto"
-                    print("[CONTROL] mode -> auto")
-                elif cmd == "manual":
-                    state["mode"] = "manual"
-                    print("[CONTROL] mode -> manual")
-                elif cmd in ["a", "d", "w", "s", "f"]:
-                    state["command"] = cmd
-                    print("[CONTROL] cmd:", cmd)
+                buffer += data.decode(errors="ignore")
 
-                mode = state["mode"]
-                command = state["command"]
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    msg = line.strip()
 
-            # act on motors (manual only)
-            if mode == "manual" and command in ["a", "d", "w", "s", "f"]:
-                motors.manual_control(command)
+                    if msg == "":
+                        continue
+
+                    with state_lock:
+                        if msg == "auto":
+                            state["mode"] = "auto"
+                        elif msg == "manual":
+                            state["mode"] = "manual"
+                        elif msg in ["a", "d", "w", "s", "f"]:
+                            state["command"] = msg
+
+                        mode = state["mode"]
+                        cmd = state["command"]
+
+                    # apply immediately
+                    if mode == "manual":
+                        motors.manual_control(cmd)
+
+        except Exception as e:
+            print("[CONTROL ERROR]", e)
+
+        finally:
+            conn.close()
+            print("[CONTROL] Client disconnected")
 
 
 # ============================================================
-#                METADATA THREAD (Pi → client)
+#   METADATA THREAD (Persistent)
 # ============================================================
 def metadata_thread():
-    HOST = "0.0.0.0"
-    PORT = 8002
 
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((HOST, PORT))
-    srv.listen(1)
+    HOST, PORT = "0.0.0.0", 8002
 
-    print("[META] Waiting...")
-    conn, addr = srv.accept()
-    print("[META] Client connected:", addr)
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((HOST, PORT))
+    server.listen(1)
+
+    print("[META] Ready on port 8002")
 
     while True:
-        with state_lock:
-            # sync shooter state from motor controller
-            state["shooter"] = bool(motors.dc.state)
-            payload = to_python(state)
+        print("[META] Waiting for client...")
+        conn, addr = server.accept()
+        print(f"[META] Client connected: {addr}")
 
         try:
-            meta = json.dumps(payload).encode()
-        except Exception as e:
-            print("[META] JSON error:", e)
-            time.sleep(0.1)
-            continue
+            while True:
+                with state_lock:
+                    state["shooter"] = bool(motors.dc.state)
+                    meta = json.dumps(to_python(state)).encode()
 
-        try:
-            conn.sendall(struct.pack(">I", len(meta)) + meta)
-        except Exception as e:
-            print("[META] disconnected:", e)
-            break
+                conn.sendall(struct.pack(">I", len(meta)) + meta)
+                time.sleep(0.03)
 
-        time.sleep(0.03)  # ~33 Hz
+        except Exception as e:
+            print("[META ERROR]", e)
+
+        finally:
+            conn.close()
+            print("[META] Client disconnected")
 
 
 # ============================================================
-#                DETECTION THREAD (shared camera)
+#   DETECTION THREAD
 # ============================================================
-def detection_thread(picam2: Picamera2):
+def detection_thread(picam2):
+
     while True:
-        frame = picam2.capture_array("main")  # RGB888
+        frame = picam2.capture_array()
+        (h, w) = frame.shape[:2]
 
-        if frame is None or frame.size == 0:
-            continue
-
-        if frame.shape[2] == 4:
-            frame = frame[:, :, :3]
-
-        # RGB -> BGR for OpenCV
-        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-
-        h, w = frame.shape[:2]
-
-        # Adaptive brightness normalization
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        mean_val = gray.mean()
-        if mean_val < 60:
-            frame = cv2.convertScaleAbs(frame, alpha=1.8, beta=40)
-        elif mean_val < 90:
-            frame = cv2.convertScaleAbs(frame, alpha=1.5, beta=20)
-
+        # SSD blob
         blob = cv2.dnn.blobFromImage(
             cv2.resize(frame, (300, 300)),
-            scalefactor=0.007843,
-            size=(300, 300),
-            mean=127.5,
+            0.007843,
+            (300, 300),
+            127.5
         )
-
         net.setInput(blob)
         detections = net.forward()
 
         persons = []
 
         for i in range(detections.shape[2]):
-            conf = float(detections[0, 0, i, 2])
+            conf = detections[0, 0, i, 2]
             cls = int(detections[0, 0, i, 1])
 
-            if cls == PERSON_CLASS_ID and conf > 0.15:
+            if cls == PERSON_ID and conf > 0.35:
                 box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
-                x1, y1, x2, y2 = [int(v) for v in box]
+                (x1, y1, x2, y2) = box.astype(int)
+                persons.append([int(x1), int(y1), int(x2), int(y2)])
 
-                # expand box slightly
-                pad_x = int((x2 - x1) * 0.1)
-                pad_y = int((y2 - y1) * 0.1)
-                x1 = max(0, x1 - pad_x)
-                y1 = max(0, y1 - pad_y)
-                x2 = min(w, x2 + pad_x)
-                y2 = min(h, y2 + pad_y)
-
-                persons.append([x1, y1, x2, y2])
-
+        # update state
         with state_lock:
             state["persons"] = persons
 
@@ -263,79 +242,64 @@ def detection_thread(picam2: Picamera2):
                 state["selected"] = -1
                 state["auto_lr"] = "none"
                 state["auto_ud"] = "none"
-            else:
-                cx, cy = w // 2, h // 2
-
-                # pick nearest to horizontal center
-                dlist = []
-                for idx, (x1, y1, x2, y2) in enumerate(persons):
-                    px = (x1 + x2) // 2
-                    dlist.append((abs(px - cx), idx))
-
-                _, sel = min(dlist)
-                sel = int(sel)
-                state["selected"] = sel
-
-                x1, y1, x2, y2 = persons[sel]
-                px = (x1 + x2) // 2
-                py = (y1 + y2) // 2
-
-                # LR control
-                if px < cx - 64:
-                    state["auto_lr"] = "left"
-                elif px > cx + 64:
-                    state["auto_lr"] = "right"
-                else:
-                    state["auto_lr"] = "center"
-
-                # UD control
-                if py < cy - 48:
-                    state["auto_ud"] = "up"
-                elif py > cy + 48:
-                    state["auto_ud"] = "down"
-                else:
-                    state["auto_ud"] = "center"
-
-
-# ============================================================
-#                AUTO CONTROL LOOP
-# ============================================================
-def auto_loop():
-    while True:
-        time.sleep(0.05)  # 20 Hz loop
-
-        with state_lock:
-            if state["mode"] != "auto":
                 continue
-            lr = state["auto_lr"]
-            ud = state["auto_ud"]
 
-        motors.auto_control(lr, ud)
+            # choose closest to center horizontally
+            cx = w // 2
+            cy = h // 2
+
+            nearest = min(
+                enumerate(persons),
+                key=lambda x: abs((x[1][0] + x[1][2]) // 2 - cx)
+            )
+
+            sel = nearest[0]
+            state["selected"] = sel
+
+            (x1, y1, x2, y2) = persons[sel]
+            px = (x1 + x2) // 2
+            py = (y1 + y2) // 2
+
+            # left-right decision
+            if px < cx - 40:
+                state["auto_lr"] = "left"
+            elif px > cx + 40:
+                state["auto_lr"] = "right"
+            else:
+                state["auto_lr"] = "center"
+
+            # up-down decision
+            if py < cy - 40:
+                state["auto_ud"] = "up"
+            elif py > cy + 40:
+                state["auto_ud"] = "down"
+            else:
+                state["auto_ud"] = "center"
+
+            # AUTO MODE EXECUTION
+            if state["mode"] == "auto":
+                motors.auto_control(state["auto_lr"], state["auto_ud"])
+
+        time.sleep(0.03)
 
 
 # ============================================================
-#                MAIN
+#   MAIN
 # ============================================================
 if __name__ == "__main__":
     picam2 = Picamera2()
-    config = picam2.create_video_configuration(
-        main={"size": (640, 480), "format": "RGB888"},
-    )
-    picam2.configure(config)
+    cfg = picam2.create_video_configuration(main={"size": (640, 480)})
+    picam2.configure(cfg)
     picam2.start()
+
+    print("[SERVER] Camera online")
 
     threading.Thread(target=video_thread, args=(picam2,), daemon=True).start()
     threading.Thread(target=control_thread, daemon=True).start()
     threading.Thread(target=metadata_thread, daemon=True).start()
     threading.Thread(target=detection_thread, args=(picam2,), daemon=True).start()
-    threading.Thread(target=auto_loop, daemon=True).start()
 
-    print("[SERVER] Online (video + control + meta + detect + auto)")
+    print("[SERVER] All subsystems online")
 
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("\n[SERVER] Shutting down...")
-        motors.cleanup()
-        picam2.stop()
+    while True:
+        time.sleep(1)
