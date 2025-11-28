@@ -13,8 +13,8 @@ PERSON = 15  # class id for "person" in MobileNetSSD
 
 # Load MobileNet SSD model (make sure these files exist in same dir)
 net = cv2.dnn.readNetFromCaffe(
-    "MobileNetSSD_deploy.prototxt",
-    "MobileNetSSD_deploy.caffemodel"
+    "./model/MobileNetSSD_deploy.prototxt",
+    "./model/MobileNetSSD_deploy.caffemodel"
 )
 
 state = {

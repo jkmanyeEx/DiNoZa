@@ -4,8 +4,8 @@ import numpy as np
 PERSON = 15  # MobileNet SSD class ID for person
 
 net = cv2.dnn.readNetFromCaffe(
-    "MobileNetSSD_deploy.prototxt",
-    "MobileNetSSD_deploy.caffemodel"
+    "../model/MobileNetSSD_deploy.prototxt",
+    "../model/MobileNetSSD_deploy.caffemodel"
 )
 
 cap = cv2.VideoCapture(0)
