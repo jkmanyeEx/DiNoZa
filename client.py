@@ -4,121 +4,93 @@ import socket
 import struct
 import threading
 
-PI_IP = "100.97.150.114"   # <- change if needed
+PI_IP = "100.101.19.24"
 VIDEO_PORT = 8000
 CONTROL_PORT = 8001
 META_PORT = 8002
 
-state = {
-    "persons": [],
-    "selected": -1,
-    "mode": "manual",
-    "command": "none",
-    "auto_lr": "none",
-    "auto_ud": "none",
-}
+state = {}
 state_lock = threading.Lock()
 
 
-# -------------------- metadata receiver --------------------
 def recv_all(sock, length):
-    buf = b""
-    while len(buf) < length:
-        chunk = sock.recv(length - len(buf))
+    data = b""
+    while len(data) < length:
+        chunk = sock.recv(length - len(data))
         if not chunk:
             return None
-        buf += chunk
-    return buf
+        data += chunk
+    return data
 
 
-def meta_thread():
+def metadata_thread():
     global state
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.connect((PI_IP, META_PORT))
     print("[META] connected")
 
     while True:
-        header = sock.recv(4)
-        if not header:
-            print("[META] disconnected")
+        hdr = sock.recv(4)
+        if not hdr:
             break
-        length = struct.unpack(">I", header)[0]
-        data = recv_all(sock, length)
-        if data is None:
-            print("[META] recv error")
+        length = struct.unpack(">I", hdr)[0]
+        payload = recv_all(sock, length)
+        if not payload:
             break
 
         try:
-            obj = json.loads(data.decode())
-        except Exception as e:
-            print("[META] JSON error:", e)
+            obj = json.loads(payload.decode())
+            with state_lock:
+                state = obj
+        except:
             continue
 
-        with state_lock:
-            state = obj
 
-
-# -------------------- HUD drawing --------------------
 def draw_hud(frame):
     with state_lock:
         persons = state.get("persons", [])
         selected = state.get("selected", -1)
         mode = state.get("mode", "manual")
-        cmd = state.get("command", "none")
-        auto_lr = state.get("auto_lr", "none")
-        auto_ud = state.get("auto_ud", "none")
+        cmd = state.get("command", "")
+        lr = state.get("auto_lr", "")
+        ud = state.get("auto_ud", "")
 
-    h, w = frame.shape[:2]
-
-    # draw persons
-    for i, p in enumerate(persons):
-        x1, y1, x2, y2 = p
+    for i, (x1, y1, x2, y2) in enumerate(persons):
         color = (0, 255, 0) if i != selected else (0, 0, 255)
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-    # selected dot
-    if 0 <= selected < len(persons):
+    if selected != -1:
         x1, y1, x2, y2 = persons[selected]
-        cx = (x1 + x2) // 2
-        cy = (y1 + y2) // 2
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
         cv2.circle(frame, (cx, cy), 6, (0, 0, 255), -1)
 
-    # HUD text
-    cv2.putText(frame, f"MODE: {mode}",
-                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
-                (0, 255, 255), 2)
-    cv2.putText(frame, f"CMD: {cmd}",
-                (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
-                (255, 255, 0), 2)
-    cv2.putText(frame, f"AUTO LR: {auto_lr}",
-                (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
-                (0, 255, 0), 2)
-    cv2.putText(frame, f"AUTO UD: {auto_ud}",
-                (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
-                (255, 200, 100), 2)
+    cv2.putText(frame, f"MODE: {mode}", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+    cv2.putText(frame, f"CMD: {cmd}", (10, 60),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
+    cv2.putText(frame, f"AUTO LR: {lr}", (10, 90),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+    cv2.putText(frame, f"AUTO UD: {ud}", (10, 120),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 100), 2)
 
 
-# -------------------- main --------------------
 if __name__ == "__main__":
-    # start metadata listener
-    threading.Thread(target=meta_thread, daemon=True).start()
+    threading.Thread(target=metadata_thread, daemon=True).start()
 
-    # control socket
-    control_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    control_sock.connect((PI_IP, CONTROL_PORT))
+    control = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    control.connect((PI_IP, CONTROL_PORT))
     print("[CONTROL] connected")
 
-    # video capture (H.264 over TCP)
     cap = cv2.VideoCapture(f"tcp://{PI_IP}:{VIDEO_PORT}")
     if not cap.isOpened():
-        print("[VIDEO] failed to open stream")
-        exit(1)
-    print("[VIDEO] connected to stream")
+        print("[VIDEO] failed to connect")
+        exit()
+
+    print("[CLIENT] running")
 
     while True:
         ret, frame = cap.read()
         if not ret:
-            print("[VIDEO] stream ended / error")
             break
 
         draw_hud(frame)
@@ -129,16 +101,12 @@ if __name__ == "__main__":
         if key == ord('q'):
             break
 
-        # mode switching
         if key == ord('m'):
-            control_sock.sendall(b"manual")
-        if key == ord('o'):
-            control_sock.sendall(b"auto")
-
-        # turret control + shooting
-        if key in [ord('a'), ord('d'), ord('w'), ord('s'), ord('f')]:
-            control_sock.sendall(bytes([key]))
+            control.sendall(b"manual")
+        elif key == ord('o'):
+            control.sendall(b"auto")
+        elif key in [ord('a'), ord('d'), ord('w'), ord('s'), ord('f')]:
+            control.sendall(chr(key).encode())
 
     cap.release()
-    control_sock.close()
     cv2.destroyAllWindows()
