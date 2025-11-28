@@ -1,193 +1,315 @@
+#!/usr/bin/env python3
 import socket
-import struct
 import threading
+import json
+import struct
+import time
+
+from picamera2 import Picamera2
+from picamera2.encoders import H264Encoder
+from picamera2.outputs import FileOutput
+
 import cv2
 import numpy as np
-from picamera2 import Picamera2
 
-VIDEO_HOST = "0.0.0.0"
-VIDEO_PORT = 8000
-CONTROL_PORT = 8001
+from motor_control import MotorControl
 
-PERSON = 15  # class id for "person" in MobileNetSSD
 
-# Load MobileNet SSD model (make sure these files exist in same dir)
-net = cv2.dnn.readNetFromCaffe(
-    "./model/MobileNetSSD_deploy.prototxt",
-    "./model/MobileNetSSD_deploy.caffemodel"
-)
+# ============================================================
+#                PERSON DETECTOR (MobileNet SSD)
+# ============================================================
+PROTOTXT = "./model/MobileNetSSD_deploy.prototxt"
+MODEL = "./model/MobileNetSSD_deploy.caffemodel"
+net = cv2.dnn.readNetFromCaffe(PROTOTXT, MODEL)
+PERSON_CLASS_ID = 15
 
+
+# ============================================================
+#                SHARED STATE (Turret Mode)
+# ============================================================
 state = {
-    "mode": "auto",   # "auto" or "manual"
-    "last_cmd": None  # latest manual command
+    "mode": "manual",     # manual / auto
+    "command": "none",    # a,d,w,s
+    "auto_lr": "none",    # left/right/center
+    "auto_ud": "none",    # up/down/center
+    "persons": [],        # list of [x1,y1,x2,y2]
+    "selected": -1        # index of closest target
 }
 
+state_lock = threading.Lock()
 
-############################################################
-# CONTROL SERVER
-############################################################
-def control_server():
-    sock = socket.socket()
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((VIDEO_HOST, CONTROL_PORT))
-    sock.listen(1)
-    print("[CONTROL] Listening")
+
+# ============================================================
+#                MOTOR MANAGER (stub)
+# ============================================================
+class MotorManager:
+
+    def __init__(self):
+        self.motorController = MotorControl(pinmap={
+            "stepper1": {"dir": 5, "step": 6},     # PAN
+            "stepper2": {"dir": 13, "step": 19},   # TILT
+            "dc": {"pin": 20}                      # SHOOTER
+        }, step_count=200)
+
+        self.PAN_STEP = 10
+        self.TILT_STEP = 10
+        self.STEP_SPEED = 0.001
+
+        self.shooting = False   # toggle state
+
+    # ---------------------------------------------------------
+    # DC CONTROL
+    # ---------------------------------------------------------
+    def shoot_on(self):
+        print("[MOTOR] SHOOT → ON (HIGH)")
+        self.motorController.dc_on()
+
+    def shoot_off(self):
+        print("[MOTOR] SHOOT → OFF (LOW)")
+        self.motorController.dc_off()
+
+    # ---------------------------------------------------------
+    # MANUAL CONTROL  (TOGGLE SHOOT)
+    # ---------------------------------------------------------
+    def manual_control(self, key):
+
+        # ----- TOGGLE SHOOT ON/OFF -----
+        if key == "f":
+            self.shooting = not self.shooting
+            if self.shooting:
+                self.shoot_on()
+            else:
+                self.shoot_off()
+            return
+
+        # ----- MOVEMENT -----
+        if key == "a":
+            print("[MOTOR] pan LEFT")
+            self.motorController.rotate_stepper1(-self.PAN_STEP, self.STEP_SPEED)
+
+        elif key == "d":
+            print("[MOTOR] pan RIGHT")
+            self.motorController.rotate_stepper1(self.PAN_STEP, self.STEP_SPEED)
+
+        elif key == "w":
+            print("[MOTOR] tilt UP")
+            self.motorController.rotate_stepper2(self.TILT_STEP, self.STEP_SPEED)
+
+        elif key == "s":
+            print("[MOTOR] tilt DOWN")
+            self.motorController.rotate_stepper2(-self.TILT_STEP, self.STEP_SPEED)
+
+        # movement DOES NOT disable shooting in toggle mode
+        if self.shooting:
+            self.shoot_on()   # ensure it stays ON
+
+    # ---------------------------------------------------------
+    # AUTO CONTROL (unchanged)
+    # ---------------------------------------------------------
+    def auto_control(self, lr, ud):
+        # ----- PAN -----
+        if lr == "left":
+            self.motorController.rotate_stepper1(-self.PAN_STEP, self.STEP_SPEED)
+        elif lr == "right":
+            self.motorController.rotate_stepper1(self.PAN_STEP, self.STEP_SPEED)
+
+        # ----- TILT -----
+        if ud == "up":
+            self.motorController.rotate_stepper2(self.TILT_STEP, self.STEP_SPEED)
+        elif ud == "down":
+            self.motorController.rotate_stepper2(-self.TILT_STEP, self.STEP_SPEED)
+
+        # ----- AUTO FIRE (only when centered) -----
+        if lr == "center" and ud == "center":
+            self.shoot_on()
+        else:
+            # only turn off if NOT manually toggled on
+            if not self.shooting:
+                self.shoot_off()
+
+motors = MotorManager()
+
+# ============================================================
+#                VIDEO STREAM THREAD (H.264)
+# ============================================================
+def video_thread():
+    HOST = "0.0.0.0"
+    PORT = 8000
+
+    picam2 = Picamera2()
+    config = picam2.create_video_configuration(main={"size": (640, 480)})
+    picam2.configure(config)
+    encoder = H264Encoder(bitrate=4000000)
+
+    print("[VIDEO] Waiting for video client...")
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((HOST, PORT))
+    srv.listen(1)
+
+    conn, addr = srv.accept()
+    print(f"[VIDEO] Client connected:", addr)
+
+    output = FileOutput(conn)
+    picam2.start_recording(encoder, output)
+    print("[VIDEO] Streaming now...")
 
     while True:
-        conn, addr = sock.accept()
-        print("[CONTROL] Client connected", addr)
-        threading.Thread(target=control_handler, args=(conn,), daemon=True).start()
+        time.sleep(1)
 
 
-def control_handler(conn):
-    buffer = b""
-    try:
-        while True:
-            data = conn.recv(1024)
-            if not data:
-                print("[CONTROL] Client disconnected")
-                break
+# ============================================================
+#                CONTROL THREAD (Client → Pi)
+# ============================================================
+def control_thread():
+    HOST = "0.0.0.0"
+    PORT = 8001
 
-            buffer += data
-            while b"\n" in buffer:
-                line, buffer = buffer.split(b"\n", 1)
-                line = line.decode().strip()
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((HOST, PORT))
+    srv.listen(1)
 
-                if line.startswith("MODE"):
-                    mode = line.split()[1].lower()
-                    state["mode"] = mode
-                    print("[CONTROL] Mode =", mode)
-
-                elif line.startswith("CMD"):
-                    cmd = line.split()[1].upper()
-                    state["last_cmd"] = cmd
-                    print("[CONTROL] Manual CMD =", cmd)
-
-    finally:
-        conn.close()
-
-
-############################################################
-# VIDEO SERVER (camera initialized once)
-############################################################
-def video_server():
-    # Initialize camera ONCE
-    cam = Picamera2()
-    config = cam.create_video_configuration(
-        main={"size": (640, 480), "format": "RGB888"},
-        buffer_count=3
-    )
-    cam.configure(config)
-    cam.start()
-    print("[VIDEO] Camera started")
-
-    # Setup TCP server
-    sock = socket.socket()
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind((VIDEO_HOST, VIDEO_PORT))
-    sock.listen(1)
-    print("[VIDEO] Listening on", VIDEO_PORT)
+    print("[CONTROL] listening on 8001")
+    conn, addr = srv.accept()
+    print("[CONTROL] client connected:", addr)
 
     while True:
-        conn, addr = sock.accept()
-        print("[VIDEO] Client connected:", addr)
-        serve_video(conn, cam)
-        conn.close()
-        print("[VIDEO] Client disconnected")
+        msg = conn.recv(1024)
+        if not msg:
+            break
+
+        try:
+            data = msg.decode().strip()
+
+            with state_lock:
+                if data == "auto":
+                    state["mode"] = "auto"
+                elif data == "manual":
+                    state["mode"] = "manual"
+                elif data in ["a", "d", "w", "s"]:
+                    state["command"] = data
+                else:
+                    print("[CONTROL] unknown:", data)
+
+            # apply motor action
+            with state_lock:
+                if state["mode"] == "manual":
+                    motors.manual_control(state["command"])
+                else:
+                    motors.auto_control(state["auto_lr"], state["auto_ud"])
+
+        except:
+            pass
 
 
-############################################################
-# HANDLE VIDEO STREAM FOR ONE CLIENT
-############################################################
-def serve_video(conn, cam):
+# ============================================================
+#                METADATA THREAD (Pi → Client)
+# ============================================================
+def metadata_thread():
+    HOST = "0.0.0.0"
+    PORT = 8002
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((HOST, PORT))
+    srv.listen(1)
+
+    print("[META] waiting on 8002")
+    conn, addr = srv.accept()
+    print("[META] client connected:", addr)
+
     while True:
-        frame = cam.capture_array()
-        h, w = frame.shape[:2]
-        mid_x = w // 2
+        with state_lock:
+            meta = json.dumps(state).encode()
 
-        # ------------- PERSON DETECTION -------------
+        conn.sendall(struct.pack(">I", len(meta)) + meta)
+        time.sleep(0.03)  # ~33 FPS metadata
+
+
+# ============================================================
+#                DETECTION THREAD
+# ============================================================
+def detection_thread():
+    picam = Picamera2()
+    config = picam.create_video_configuration(main={"size": (640, 480)})
+    picam.configure(config)
+    picam.start()
+
+    while True:
+        frame = picam.capture_array()
+        (h, w) = frame.shape[:2]
+
         blob = cv2.dnn.blobFromImage(
             cv2.resize(frame, (300, 300)),
             0.007843,
             (300, 300),
-            127.5
+            127.5,
         )
         net.setInput(blob)
         detections = net.forward()
 
-        boxes = []
-        confs = []
+        persons = []
 
-        # Collect raw boxes & confidences
         for i in range(detections.shape[2]):
             conf = detections[0, 0, i, 2]
             cls = int(detections[0, 0, i, 1])
-
-            if cls == PERSON and conf > 0.60:  # threshold tuned
+            if cls == PERSON_CLASS_ID and conf > 0.45:
                 box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
-                x1, y1, x2, y2 = box.astype(int)
-                boxes.append([x1, y1, x2 - x1, y2 - y1])  # x, y, w, h
-                confs.append(float(conf))
+                (x1, y1, x2, y2) = box.astype(int)
+                persons.append([x1, y1, x2, y2])
 
-        candidates = []
+        with state_lock:
+            state["persons"] = persons
 
-        # ------------- NMS TO MERGE OVERLAPS -------------
-        if len(boxes) > 0:
-            idxs = cv2.dnn.NMSBoxes(boxes, confs, score_threshold=0.60, nms_threshold=0.40)
+            if len(persons) == 0:
+                state["selected"] = -1
+                state["auto_lr"] = "none"
+                state["auto_ud"] = "none"
+                continue
 
-            if len(idxs) > 0:
-                # idxs might be list of lists or np array
-                for i in np.array(idxs).flatten():
-                    x, y, bw, bh = boxes[i]
-                    x1, y1 = x, y
-                    x2, y2 = x + bw, y + bh
+            # pick person closest to horizontal center
+            cx = w // 2
+            cy = h // 2
+            dist_list = []
+            for idx, p in enumerate(persons):
+                px_center = (p[0] + p[2]) // 2
+                dist_list.append((abs(px_center - cx), idx))
 
-                    # Draw bounding box
-                    cv2.rectangle(frame, (x1, y1), (x2, y2),
-                                  (0, 255, 0), 2)
+            _, sel = min(dist_list)
+            state["selected"] = sel
 
-                    # Center point
-                    cx = (x1 + x2) // 2
-                    cy = (y1 + y2) // 2
-                    cv2.circle(frame, (cx, cy), 4, (0, 0, 255), -1)
+            x1, y1, x2, y2 = persons[sel]
+            px = (x1 + x2) // 2
+            py = (y1 + y2) // 2
 
-                    # For AUTO logic: (distance to center, cx, cy)
-                    candidates.append((abs(cx - mid_x), cx, cy))
-
-        # Debug: how many persons after NMS
-        # print("[DETECT] Persons after NMS:", len(candidates))
-
-        # ------------- AUTO MODE: PICK CLOSEST TO CENTER -------------
-        if state["mode"] == "auto" and candidates:
-            # sort by |cx - mid_x| (closest to screen center)
-            candidates.sort(key=lambda x: x[0])
-            _, cx, cy = candidates[0]
-
-            # highlight chosen target
-            cv2.circle(frame, (cx, cy), 12, (255, 0, 0), 2)
-
-            if cx < mid_x - 40:
-                print("[AUTO] LEFT")
-            elif cx > mid_x + 40:
-                print("[AUTO] RIGHT")
+            # -------- LEFT / RIGHT --------
+            if px < cx - 40:
+                state["auto_lr"] = "left"
+            elif px > cx + 40:
+                state["auto_lr"] = "right"
             else:
-                print("[AUTO] CENTER")
+                state["auto_lr"] = "center"
 
-        # ------------- ENCODE & SEND FRAME -------------
-        ok, jpg = cv2.imencode(".jpg", frame,
-                               [cv2.IMWRITE_JPEG_QUALITY, 80])
-        if not ok:
-            continue
-
-        try:
-            conn.sendall(struct.pack(">I", len(jpg)) + jpg.tobytes())
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            break
+            # -------- UP / DOWN (Turret) --------
+            if py < cy - 40:
+                state["auto_ud"] = "up"
+            elif py > cy + 40:
+                state["auto_ud"] = "down"
+            else:
+                state["auto_ud"] = "center"
 
 
-############################################################
-# MAIN ENTRY
-############################################################
+# ============================================================
+#                MAIN
+# ============================================================
 if __name__ == "__main__":
-    threading.Thread(target=control_server, daemon=True).start()
-    video_server()
+    threading.Thread(target=video_thread, daemon=True).start()
+    threading.Thread(target=control_thread, daemon=True).start()
+    threading.Thread(target=metadata_thread, daemon=True).start()
+    threading.Thread(target=detection_thread, daemon=True).start()
+
+    print("[SERVER] all subsystems online (H.264 + JSON + detection + control)")
+
+    while True:
+        time.sleep(1)
