@@ -59,54 +59,86 @@ def to_python(obj):
 #   MOTOR MANAGER
 # ============================================================
 motors = MotorControl({
-    "stepper1": [5, 6, 13, 19],      # L298N pins for PAN
-    "stepper2": [12, 16, 20, 21],    # L298N pins for TILT
-    "dc": {"pin": 23}                # MOSFET gate pin for shooter
+    "stepper1": [21, 20, 23, 24],      # L298N pins for PAN
+    "stepper2": [-1, -1, -1, -1],    # L298N pins for TILT
+    "dc": {"pin": -1}                # MOSFET gate pin for shooter
 })
 
 
 # ============================================================
 #   VIDEO STREAM THREAD (Persistent)
 # ============================================================
-def video_thread(picam2):
-    HOST, PORT = "0.0.0.0", 8000
+def video_thread():
 
-    encoder = H264Encoder(bitrate=4_000_000)
+    HOST, PORT = "0.0.0.0", 8000
 
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((HOST, PORT))
     server.listen(1)
 
-    print("[VIDEO] Ready on port 8000")
+    print("[VIDEO] Ready on 8000")
 
     while True:
         print("[VIDEO] Waiting for client...")
         conn, addr = server.accept()
-        print(f"[VIDEO] Client connected: {addr}")
+        print("[VIDEO] Client connected:", addr)
 
-        sock_file = conn.makefile("wb")
-        output = FileOutput(sock_file)
-
+        # ========= REINITIALIZE CAMERA EVERY SESSION =========
         try:
+            picam2 = Picamera2()
+            cfg = picam2.create_video_configuration(main={"size": (640, 480)})
+            picam2.configure(cfg)
+
+            encoder = H264Encoder(bitrate=4_000_000)
+
+            sock_file = conn.makefile("wb")
+            output = FileOutput(sock_file)
+
+            picam2.start()
             picam2.start_encoder(encoder, output)
-            print("[VIDEO] Encoder started")
+            print("[VIDEO] Encoder started fresh")
 
             while True:
-                time.sleep(0.25)
+                # encoder runs async
+                time.sleep(0.3)
 
         except Exception as e:
             print("[VIDEO ERROR]", e)
 
         finally:
-            print("[VIDEO] Cleaning encoder...")
+            print("[VIDEO] Cleaning up camera + encoder...")
+
+            # stop encoder safely
             try:
                 picam2.stop_encoder()
             except:
                 pass
-            sock_file.close()
-            conn.close()
-            print("[VIDEO] Client disconnected")
+
+            # stop camera
+            try:
+                picam2.stop()
+            except:
+                pass
+
+            # close device fully
+            try:
+                picam2.close()
+            except:
+                pass
+
+            try:
+                sock_file.close()
+            except:
+                pass
+
+            try:
+                conn.close()
+            except:
+                pass
+
+            print("[VIDEO] Cleaned successfully. Ready for next client.\n")
+
 
 
 # ============================================================

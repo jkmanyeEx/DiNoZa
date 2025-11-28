@@ -1,0 +1,7 @@
+{
+  "motors": {
+    "stepper1_enabled": true,
+    "stepper2_enabled": false,
+    "dc_enabled": false
+  }
+}
